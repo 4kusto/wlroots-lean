@@ -96,6 +96,7 @@ struct compositor {
   struct wl_listener new_output;
   struct wl_listener new_input;
   struct wl_listener new_xdg_surface;
+  struct wl_listener new_xdg_toplevel;
 
   struct wl_list outputs;   // struct wlrlean_output::link
   struct wl_list views;     // struct wlrlean_view::link
@@ -451,6 +452,9 @@ static void maybe_setup_toplevel(struct wlrlean_view *view) {
   if (view->xdg_surface->role != WLR_XDG_SURFACE_ROLE_TOPLEVEL || !view->xdg_surface->toplevel) {
     return;
   }
+  if (!view->xdg_surface->initialized) {
+    return;
+  }
 
   if (!view->initial_configure_sent) {
     struct wlr_box box = {0};
@@ -491,9 +495,26 @@ static void handle_view_destroy(struct wl_listener *listener, void *data) {
 static void handle_new_xdg_surface(struct wl_listener *listener, void *data) {
   struct compositor *comp = wl_container_of(listener, comp, new_xdg_surface);
   struct wlr_xdg_surface *xdg_surface = data;
-  if (!xdg_surface || xdg_surface->role != WLR_XDG_SURFACE_ROLE_TOPLEVEL || !xdg_surface->toplevel) {
+  if (!xdg_surface) {
     return;
   }
+
+  // Keep this listener only for diagnostics. Some clients may emit
+  // new_surface before role assignment, so the actual view creation path uses
+  // xdg_shell.events.new_toplevel.
+  fprintf(stderr, "[c] xdg new_surface role=%d\n", (int)xdg_surface->role);
+  if (xdg_surface->role != WLR_XDG_SURFACE_ROLE_TOPLEVEL || !xdg_surface->toplevel) {
+    return;
+  }
+}
+
+static void handle_new_xdg_toplevel(struct wl_listener *listener, void *data) {
+  struct compositor *comp = wl_container_of(listener, comp, new_xdg_toplevel);
+  struct wlr_xdg_toplevel *toplevel = data;
+  if (!toplevel || !toplevel->base || !toplevel->base->surface) {
+    return;
+  }
+  struct wlr_xdg_surface *xdg_surface = toplevel->base;
 
   struct wlrlean_view *view = calloc(1, sizeof(*view));
   if (!view) {
@@ -503,10 +524,10 @@ static void handle_new_xdg_surface(struct wl_listener *listener, void *data) {
   view->comp = comp;
   view->xdg_surface = xdg_surface;
   view->id = ++comp->next_surface_id;
-  fprintf(stderr, "[c] new_xdg_surface id=%" PRIu64 " role=%d\n", view->id, xdg_surface->role);
+  fprintf(stderr, "[c] new_xdg_toplevel id=%" PRIu64 " role=%d\n", view->id, xdg_surface->role);
   view->scene_tree = wlr_scene_xdg_surface_create(&comp->scene->tree, xdg_surface);
   if (!view->scene_tree) {
-    fprintf(stderr, "[c] new_xdg_surface: failed to create scene tree for id=%" PRIu64 "\n", view->id);
+    fprintf(stderr, "[c] new_xdg_toplevel: failed to create scene tree for id=%" PRIu64 "\n", view->id);
     free(view);
     return;
   }
@@ -525,7 +546,6 @@ static void handle_new_xdg_surface(struct wl_listener *listener, void *data) {
   wl_signal_add(&xdg_surface->surface->events.destroy, &view->destroy);
 
   wl_list_insert(&comp->views, &view->link);
-  maybe_setup_toplevel(view);
 }
 
 static void handle_output_frame(struct wl_listener *listener, void *data) {
@@ -815,6 +835,8 @@ compositor_t *comp_create(void) {
 
   comp->new_xdg_surface.notify = handle_new_xdg_surface;
   wl_signal_add(&comp->xdg_shell->events.new_surface, &comp->new_xdg_surface);
+  comp->new_xdg_toplevel.notify = handle_new_xdg_toplevel;
+  wl_signal_add(&comp->xdg_shell->events.new_toplevel, &comp->new_xdg_toplevel);
 
   fprintf(stderr, "[c] comp_create: ok (build=2026-02-21c)\n");
   return comp;
