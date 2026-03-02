@@ -22,10 +22,13 @@ private def readPkgConfigFirst (argSets : Array (Array String)) : IO (Array Stri
   return #[]
 
 private def wlrootsCFlags : Array String :=
-  run_io readPkgConfigFirst #[
-    #["--cflags", "wlroots"],
-    #["--cflags", "wlroots-0.19"]
-  ]
+  run_io do
+    let wlr ← readPkgConfigFirst #[
+      #["--cflags", "wlroots"],
+      #["--cflags", "wlroots-0.19"]
+    ]
+    let xcb ← readPkgConfig #["--cflags", "xcb", "xcb-ewmh", "xcb-icccm"]
+    return wlr ++ xcb
 
 private def wlrootsLibs : Array String :=
   run_io do
@@ -35,7 +38,8 @@ private def wlrootsLibs : Array String :=
     ]
     let wl ← readPkgConfig #["--libs", "wayland-server"]
     let xkb ← readPkgConfig #["--libs", "xkbcommon"]
-    return wlr ++ wl ++ xkb
+    let xcb ← readPkgConfig #["--libs", "xcb", "xcb-ewmh", "xcb-icccm"]
+    return wlr ++ wl ++ xkb ++ xcb
 
 package Wlroots where
   moreLinkArgs := wlrootsLibs

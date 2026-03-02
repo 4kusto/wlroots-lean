@@ -16,6 +16,15 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 
+#if !defined(SHIM_DISABLE_XWAYLAND) && defined(__has_include)
+#if __has_include(<wlr/xwayland.h>) && __has_include(<xcb/xcb.h>)
+#define WLRLEAN_HAS_XWAYLAND 1
+#endif
+#endif
+#ifndef WLRLEAN_HAS_XWAYLAND
+#define WLRLEAN_HAS_XWAYLAND 0
+#endif
+
 #include <wayland-server-core.h>
 #include <wayland-server-protocol.h>
 #include <wlr/backend.h>
@@ -35,8 +44,15 @@
 #include <wlr/types/wlr_subcompositor.h>
 #include <wlr/types/wlr_xcursor_manager.h>
 #include <wlr/types/wlr_xdg_shell.h>
+#include <wlr/types/wlr_layer_shell_v1.h>
 #include <wlr/util/edges.h>
 #include <wlr/util/log.h>
+#if WLRLEAN_HAS_XWAYLAND
+#include <wlr/xwayland.h>
+#else
+struct wlr_xwayland;
+struct wlr_xwayland_surface;
+#endif
 #include <xkbcommon/xkbcommon.h>
 #include <xkbcommon/xkbcommon-keysyms.h>
 
@@ -66,6 +82,47 @@ struct wlrlean_view {
   uint64_t id;
 };
 
+struct wlrlean_xwayland_view {
+  struct compositor *comp;
+  struct wl_list link;
+
+#if WLRLEAN_HAS_XWAYLAND
+  struct wlr_xwayland_surface *xsurface;
+  struct wlr_scene_tree *scene_tree;
+
+  struct wl_listener map;
+  struct wl_listener unmap;
+  struct wl_listener set_geometry;
+  struct wl_listener request_configure;
+  struct wl_listener request_activate;
+  struct wl_listener associate;
+  struct wl_listener dissociate;
+  struct wl_listener destroy;
+
+  bool mapped;
+  bool associated;
+#else
+  void *xsurface;
+  void *scene_tree;
+  bool mapped;
+#endif
+  uint64_t id;
+};
+
+struct wlrlean_layer_surface {
+  struct compositor *comp;
+  struct wl_list link;
+
+  struct wlr_layer_surface_v1 *layer_surface;
+  struct wlr_scene_layer_surface_v1 *scene_layer_surface;
+  bool mapped;
+
+  struct wl_listener map;
+  struct wl_listener unmap;
+  struct wl_listener commit;
+  struct wl_listener destroy;
+};
+
 struct wlrlean_output {
   struct compositor *comp;
   struct wl_list link;
@@ -91,21 +148,32 @@ struct compositor {
   struct wl_display *display;
   struct wl_event_loop *event_loop;
   struct wlr_backend *backend;
+  struct wlr_compositor *wlr_compositor;
   struct wlr_renderer *renderer;
   struct wlr_allocator *allocator;
 
   struct wlr_output_layout *output_layout;
   struct wlr_scene *scene;
+  struct wlr_scene_tree *background_tree;
+  struct wlr_scene_tree *bottom_tree;
+  struct wlr_scene_tree *workspace_tree;
+  struct wlr_scene_tree *top_tree;
+  struct wlr_scene_tree *overlay_tree;
   struct wlr_cursor *cursor;
   struct wlr_xcursor_manager *cursor_mgr;
 
   struct wlr_seat *seat;
   struct wlr_xdg_shell *xdg_shell;
+  struct wlr_layer_shell_v1 *layer_shell;
+  struct wlr_xwayland *xwayland;
 
   struct wl_listener new_output;
   struct wl_listener new_input;
   struct wl_listener new_xdg_surface;
   struct wl_listener new_xdg_toplevel;
+  struct wl_listener new_layer_surface;
+  struct wl_listener new_xwayland_surface;
+  struct wl_listener xwayland_ready;
   struct wl_listener request_cursor;
 
   struct wl_listener cursor_motion;
@@ -116,9 +184,12 @@ struct compositor {
 
   struct wl_list outputs;   // struct wlrlean_output::link
   struct wl_list views;     // struct wlrlean_view::link
+  struct wl_list xwayland_views; // struct wlrlean_xwayland_view::link
+  struct wl_list layer_surfaces; // struct wlrlean_layer_surface::link
   struct wl_list keyboards; // struct wlrlean_keyboard::link
 
   struct wlrlean_view *focused_view;
+  struct wlrlean_xwayland_view *focused_xwayland_view;
   bool destroying;
   uint32_t pointer_focus_mode;
 
@@ -137,6 +208,8 @@ struct compositor {
   event_t last_event;
 };
 
+static void arrange_layer_surfaces(struct compositor *comp);
+
 static bool setup_renderer_allocator(struct compositor *comp) {
   comp->renderer = wlr_renderer_autocreate(comp->backend);
   comp->allocator = comp->renderer ? wlr_allocator_autocreate(comp->backend, comp->renderer) : NULL;
@@ -146,8 +219,8 @@ static bool setup_renderer_allocator(struct compositor *comp) {
   }
 
   wlr_renderer_init_wl_display(comp->renderer, comp->display);
-  (void)wlr_compositor_create(comp->display, 6, comp->renderer);
-  return true;
+  comp->wlr_compositor = wlr_compositor_create(comp->display, 6, comp->renderer);
+  return comp->wlr_compositor != NULL;
 }
 
 static bool env_has_word(const char *name, const char *word) {
@@ -259,6 +332,7 @@ static void push_output_size_if_changed(struct compositor *comp) {
   }
   comp->layout_width = w;
   comp->layout_height = h;
+  arrange_layer_surfaces(comp);
   push_event(comp, EV_OUTPUT_SIZE, (uint64_t)w, (uint64_t)h);
 }
 
@@ -331,6 +405,7 @@ static void spawn_command(const char *cmd) {
   unsetenv("WAYLAND_SOCKET");
   close_extra_fds_in_child();
   const char *wd = getenv("WAYLAND_DISPLAY");
+  const char *xd = getenv("DISPLAY");
   const char *xr = getenv("XDG_RUNTIME_DIR");
   const char *path = getenv("PATH");
   if (!path) {
@@ -343,10 +418,16 @@ static void spawn_command(const char *cmd) {
     _exit(127);
   }
 
-  char wrapped[1024];
-  int n = snprintf(wrapped, sizeof(wrapped),
-                   "env -u WAYLAND_SOCKET WAYLAND_DISPLAY='%s' XDG_RUNTIME_DIR='%s' PATH='%s' %s", wd, xr, path,
-                   cmd);
+  char wrapped[1400];
+  int n;
+  if (xd && xd[0] != '\0') {
+    n = snprintf(wrapped, sizeof(wrapped),
+                 "env -u WAYLAND_SOCKET WAYLAND_DISPLAY='%s' DISPLAY='%s' XDG_RUNTIME_DIR='%s' PATH='%s' %s", wd, xd,
+                 xr, path, cmd);
+  } else {
+    n = snprintf(wrapped, sizeof(wrapped), "env -u WAYLAND_SOCKET WAYLAND_DISPLAY='%s' XDG_RUNTIME_DIR='%s' PATH='%s' %s",
+                 wd, xr, path, cmd);
+  }
   if (n < 0 || (size_t)n >= sizeof(wrapped)) {
     execl("/bin/sh", "sh", "-lc", cmd, (char *)NULL);
     _exit(127);
@@ -425,11 +506,15 @@ static int spawn_by_id(struct compositor *comp, uint64_t app_id) {
 }
 
 static void focus_view(struct compositor *comp, struct wlrlean_view *view);
+static void focus_xwayland_view(struct compositor *comp, struct wlrlean_xwayland_view *view);
 static void maybe_setup_toplevel(struct wlrlean_view *view);
 static struct wlrlean_view *find_view_by_id(struct compositor *comp, uint64_t id);
+static struct wlrlean_xwayland_view *find_xwayland_view_by_id(struct compositor *comp, uint64_t id);
 static void process_cursor_motion(struct compositor *comp, uint32_t time_msec);
 static struct wlrlean_view *view_at_cursor(struct compositor *comp);
+static struct wlrlean_xwayland_view *xwayland_view_at_cursor(struct compositor *comp);
 static void set_default_cursor(struct compositor *comp);
+static struct wlr_scene_tree *layer_tree_for(struct compositor *comp, enum zwlr_layer_shell_v1_layer layer);
 
 static struct wlrlean_keyboard *first_keyboard(struct compositor *comp) {
   if (wl_list_empty(&comp->keyboards)) {
@@ -449,6 +534,56 @@ static void update_seat_capabilities(struct compositor *comp) {
   wlr_seat_set_capabilities(comp->seat, caps);
 }
 
+static struct wlr_scene_tree *layer_tree_for(struct compositor *comp, enum zwlr_layer_shell_v1_layer layer) {
+  if (!comp) {
+    return NULL;
+  }
+  switch (layer) {
+  case ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND:
+    return comp->background_tree;
+  case ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM:
+    return comp->bottom_tree;
+  case ZWLR_LAYER_SHELL_V1_LAYER_TOP:
+    return comp->top_tree;
+  case ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY:
+    return comp->overlay_tree;
+  default:
+    return comp->top_tree;
+  }
+}
+
+static void arrange_layer_surfaces(struct compositor *comp) {
+  if (!comp || !comp->output_layout) {
+    return;
+  }
+
+  struct wlr_box full = {0};
+  wlr_output_layout_get_box(comp->output_layout, NULL, &full);
+  if (full.width <= 0 || full.height <= 0) {
+    return;
+  }
+
+  struct wlr_box usable = full;
+  struct wlrlean_layer_surface *layer;
+  enum zwlr_layer_shell_v1_layer pass[] = {
+      ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND,
+      ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM,
+      ZWLR_LAYER_SHELL_V1_LAYER_TOP,
+      ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY,
+  };
+  for (size_t i = 0; i < sizeof(pass) / sizeof(pass[0]); i++) {
+    wl_list_for_each(layer, &comp->layer_surfaces, link) {
+      if (!layer->scene_layer_surface || !layer->layer_surface) {
+        continue;
+      }
+      if (layer->layer_surface->pending.layer != pass[i] && layer->layer_surface->current.layer != pass[i]) {
+        continue;
+      }
+      wlr_scene_layer_surface_v1_configure(layer->scene_layer_surface, &full, &usable);
+    }
+  }
+}
+
 static void set_default_cursor(struct compositor *comp) {
   if (!comp || !comp->cursor || !comp->cursor_mgr) {
     return;
@@ -459,6 +594,37 @@ static void set_default_cursor(struct compositor *comp) {
 static struct wlr_surface *surface_at_cursor(struct compositor *comp, double *sx, double *sy) {
   if (!comp || !comp->cursor || !comp->scene) {
     return NULL;
+  }
+
+  // Layer-shell surfaces must get pointer hit-testing priority over tiled views.
+  enum zwlr_layer_shell_v1_layer pass[] = {
+      ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY,
+      ZWLR_LAYER_SHELL_V1_LAYER_TOP,
+      ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM,
+      ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND,
+  };
+  for (size_t i = 0; i < sizeof(pass) / sizeof(pass[0]); i++) {
+    struct wlrlean_layer_surface *layer;
+    wl_list_for_each(layer, &comp->layer_surfaces, link) {
+      if (!layer->mapped || !layer->layer_surface || !layer->scene_layer_surface) {
+        continue;
+      }
+      enum zwlr_layer_shell_v1_layer layer_kind = layer->layer_surface->current.layer;
+      if (layer_kind != pass[i]) {
+        continue;
+      }
+      int lx = 0, ly = 0;
+      if (!wlr_scene_node_coords(&layer->scene_layer_surface->tree->node, &lx, &ly)) {
+        continue;
+      }
+      double local_x = comp->cursor->x - lx;
+      double local_y = comp->cursor->y - ly;
+      struct wlr_surface *s =
+          wlr_layer_surface_v1_surface_at(layer->layer_surface, local_x, local_y, sx, sy);
+      if (s) {
+        return s;
+      }
+    }
   }
 
   struct wlr_scene_node *node = wlr_scene_node_at(&comp->scene->tree.node, comp->cursor->x, comp->cursor->y, sx, sy);
@@ -499,6 +665,32 @@ static struct wlrlean_view *view_at_cursor(struct compositor *comp) {
   return NULL;
 }
 
+static struct wlrlean_xwayland_view *xwayland_view_at_cursor(struct compositor *comp) {
+#if !WLRLEAN_HAS_XWAYLAND
+  (void)comp;
+  return NULL;
+#else
+  double sx = 0, sy = 0;
+  struct wlr_surface *surface = surface_at_cursor(comp, &sx, &sy);
+  if (!surface) {
+    return NULL;
+  }
+
+  struct wlr_xwayland_surface *xsurface = wlr_xwayland_surface_try_from_wlr_surface(surface);
+  if (!xsurface) {
+    return NULL;
+  }
+
+  struct wlrlean_xwayland_view *view;
+  wl_list_for_each(view, &comp->xwayland_views, link) {
+    if (view->xsurface == xsurface) {
+      return view;
+    }
+  }
+  return NULL;
+#endif
+}
+
 static void process_cursor_motion(struct compositor *comp, uint32_t time_msec) {
   if (!comp || !comp->seat) {
     return;
@@ -518,6 +710,11 @@ static void process_cursor_motion(struct compositor *comp, uint32_t time_msec) {
     struct wlrlean_view *view = view_at_cursor(comp);
     if (view) {
       focus_view(comp, view);
+      return;
+    }
+    struct wlrlean_xwayland_view *xview = xwayland_view_at_cursor(comp);
+    if (xview) {
+      focus_xwayland_view(comp, xview);
     }
   }
 }
@@ -569,6 +766,11 @@ static void handle_cursor_button(struct wl_listener *listener, void *data) {
     struct wlrlean_view *view = view_at_cursor(comp);
     if (view) {
       focus_view(comp, view);
+      return;
+    }
+    struct wlrlean_xwayland_view *xview = xwayland_view_at_cursor(comp);
+    if (xview) {
+      focus_xwayland_view(comp, xview);
     }
   }
 }
@@ -598,6 +800,13 @@ static void focus_view(struct compositor *comp, struct wlrlean_view *view) {
     return;
   }
 
+#if WLRLEAN_HAS_XWAYLAND
+  if (comp->focused_xwayland_view && comp->focused_xwayland_view->xsurface) {
+    wlr_xwayland_surface_activate(comp->focused_xwayland_view->xsurface, false);
+    comp->focused_xwayland_view = NULL;
+  }
+#endif
+
   if (comp->focused_view && comp->focused_view != view && comp->focused_view->xdg_surface &&
       comp->focused_view->xdg_surface->toplevel) {
     wlr_xdg_toplevel_set_activated(comp->focused_view->xdg_surface->toplevel, false);
@@ -614,6 +823,37 @@ static void focus_view(struct compositor *comp, struct wlrlean_view *view) {
   }
 }
 
+static void focus_xwayland_view(struct compositor *comp, struct wlrlean_xwayland_view *view) {
+#if !WLRLEAN_HAS_XWAYLAND
+  (void)comp;
+  (void)view;
+  return;
+#else
+  if (!comp || !view || !view->mapped || !view->xsurface || !view->xsurface->surface) {
+    return;
+  }
+
+  if (comp->focused_view && comp->focused_view->xdg_surface && comp->focused_view->xdg_surface->toplevel) {
+    wlr_xdg_toplevel_set_activated(comp->focused_view->xdg_surface->toplevel, false);
+    comp->focused_view = NULL;
+  }
+
+  if (comp->focused_xwayland_view && comp->focused_xwayland_view != view && comp->focused_xwayland_view->xsurface) {
+    wlr_xwayland_surface_activate(comp->focused_xwayland_view->xsurface, false);
+  }
+
+  comp->focused_xwayland_view = view;
+  wlr_scene_node_raise_to_top(&view->scene_tree->node);
+  wlr_xwayland_surface_activate(view->xsurface, true);
+
+  struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(comp->seat);
+  if (keyboard) {
+    wlr_seat_keyboard_notify_enter(comp->seat, view->xsurface->surface, keyboard->keycodes,
+                                   keyboard->num_keycodes, &keyboard->modifiers);
+  }
+#endif
+}
+
 static struct wlrlean_view *find_view_by_id(struct compositor *comp, uint64_t id) {
   if (!comp) {
     return NULL;
@@ -625,6 +865,25 @@ static struct wlrlean_view *find_view_by_id(struct compositor *comp, uint64_t id
     }
   }
   return NULL;
+}
+
+static struct wlrlean_xwayland_view *find_xwayland_view_by_id(struct compositor *comp, uint64_t id) {
+#if !WLRLEAN_HAS_XWAYLAND
+  (void)comp;
+  (void)id;
+  return NULL;
+#else
+  if (!comp) {
+    return NULL;
+  }
+  struct wlrlean_xwayland_view *view;
+  wl_list_for_each(view, &comp->xwayland_views, link) {
+    if (view->id == id) {
+      return view;
+    }
+  }
+  return NULL;
+#endif
 }
 
 static void handle_view_map(struct wl_listener *listener, void *data) {
@@ -737,7 +996,7 @@ static void handle_new_xdg_toplevel(struct wl_listener *listener, void *data) {
   view->xdg_surface = xdg_surface;
   view->id = ++comp->next_surface_id;
   fprintf(stderr, "[c] new_xdg_toplevel id=%" PRIu64 " role=%d\n", view->id, xdg_surface->role);
-  view->scene_tree = wlr_scene_xdg_surface_create(&comp->scene->tree, xdg_surface);
+  view->scene_tree = wlr_scene_xdg_surface_create(comp->workspace_tree, xdg_surface);
   if (!view->scene_tree) {
     fprintf(stderr, "[c] new_xdg_toplevel: failed to create scene tree for id=%" PRIu64 "\n", view->id);
     free(view);
@@ -759,6 +1018,258 @@ static void handle_new_xdg_toplevel(struct wl_listener *listener, void *data) {
 
   wl_list_insert(&comp->views, &view->link);
 }
+
+static struct wlr_output *first_output_wlr(struct compositor *comp) {
+  if (!comp || wl_list_empty(&comp->outputs)) {
+    return NULL;
+  }
+  struct wlrlean_output *output = wl_container_of(comp->outputs.next, (struct wlrlean_output *)NULL, link);
+  return output->wlr_output;
+}
+
+static void handle_layer_surface_map(struct wl_listener *listener, void *data) {
+  (void)data;
+  struct wlrlean_layer_surface *layer = wl_container_of(listener, layer, map);
+  layer->mapped = true;
+  arrange_layer_surfaces(layer->comp);
+}
+
+static void handle_layer_surface_unmap(struct wl_listener *listener, void *data) {
+  (void)data;
+  struct wlrlean_layer_surface *layer = wl_container_of(listener, layer, unmap);
+  layer->mapped = false;
+  arrange_layer_surfaces(layer->comp);
+}
+
+static void handle_layer_surface_commit(struct wl_listener *listener, void *data) {
+  (void)data;
+  struct wlrlean_layer_surface *layer = wl_container_of(listener, layer, commit);
+  arrange_layer_surfaces(layer->comp);
+}
+
+static void handle_layer_surface_destroy(struct wl_listener *listener, void *data) {
+  (void)data;
+  struct wlrlean_layer_surface *layer = wl_container_of(listener, layer, destroy);
+  wl_list_remove(&layer->link);
+  wl_list_remove(&layer->map.link);
+  wl_list_remove(&layer->unmap.link);
+  wl_list_remove(&layer->commit.link);
+  wl_list_remove(&layer->destroy.link);
+  free(layer);
+}
+
+static void handle_new_layer_surface(struct wl_listener *listener, void *data) {
+  struct compositor *comp = wl_container_of(listener, comp, new_layer_surface);
+  struct wlr_layer_surface_v1 *layer_surface = data;
+  if (!comp || !layer_surface) {
+    return;
+  }
+
+  if (!layer_surface->output) {
+    layer_surface->output = first_output_wlr(comp);
+  }
+
+  struct wlr_scene_tree *parent = layer_tree_for(comp, layer_surface->pending.layer);
+  if (!parent) {
+    parent = comp->top_tree;
+  }
+  struct wlr_scene_layer_surface_v1 *scene_layer = wlr_scene_layer_surface_v1_create(parent, layer_surface);
+  if (!scene_layer) {
+    fprintf(stderr, "[c] layer_surface: failed to create scene helper\n");
+    return;
+  }
+
+  struct wlrlean_layer_surface *layer = calloc(1, sizeof(*layer));
+  if (!layer) {
+    wlr_scene_node_destroy(&scene_layer->tree->node);
+    return;
+  }
+
+  layer->comp = comp;
+  layer->layer_surface = layer_surface;
+  layer->scene_layer_surface = scene_layer;
+  layer->mapped = layer_surface->surface && layer_surface->surface->mapped;
+
+  layer->map.notify = handle_layer_surface_map;
+  wl_signal_add(&layer_surface->surface->events.map, &layer->map);
+  layer->unmap.notify = handle_layer_surface_unmap;
+  wl_signal_add(&layer_surface->surface->events.unmap, &layer->unmap);
+  layer->commit.notify = handle_layer_surface_commit;
+  wl_signal_add(&layer_surface->surface->events.commit, &layer->commit);
+  layer->destroy.notify = handle_layer_surface_destroy;
+  wl_signal_add(&layer_surface->events.destroy, &layer->destroy);
+
+  wl_list_insert(&comp->layer_surfaces, &layer->link);
+  arrange_layer_surfaces(comp);
+}
+
+#if WLRLEAN_HAS_XWAYLAND
+static void handle_xwayland_surface_map(struct wl_listener *listener, void *data) {
+  (void)data;
+  struct wlrlean_xwayland_view *view = wl_container_of(listener, view, map);
+  view->mapped = true;
+  wlr_scene_node_set_enabled(&view->scene_tree->node, true);
+  push_event(view->comp, EV_NEW_XDG_SURFACE, view->id, 0);
+  focus_xwayland_view(view->comp, view);
+}
+
+static void handle_xwayland_surface_unmap(struct wl_listener *listener, void *data) {
+  (void)data;
+  struct wlrlean_xwayland_view *view = wl_container_of(listener, view, unmap);
+  view->mapped = false;
+  wlr_scene_node_set_enabled(&view->scene_tree->node, false);
+  if (view->comp->focused_xwayland_view == view) {
+    view->comp->focused_xwayland_view = NULL;
+  }
+  push_event(view->comp, EV_VIEW_UNMAP, view->id, 0);
+}
+
+static void handle_xwayland_set_geometry(struct wl_listener *listener, void *data) {
+  (void)data;
+  struct wlrlean_xwayland_view *view = wl_container_of(listener, view, set_geometry);
+  if (!view->scene_tree || !view->xsurface) {
+    return;
+  }
+  wlr_scene_node_set_position(&view->scene_tree->node, view->xsurface->x, view->xsurface->y);
+}
+
+static void handle_xwayland_request_configure(struct wl_listener *listener, void *data) {
+  struct wlrlean_xwayland_view *view = wl_container_of(listener, view, request_configure);
+  struct wlr_xwayland_surface_configure_event *event = data;
+  if (!view || !view->xsurface || !event) {
+    return;
+  }
+  wlr_xwayland_surface_configure(view->xsurface, event->x, event->y, event->width, event->height);
+  if (view->scene_tree) {
+    wlr_scene_node_set_position(&view->scene_tree->node, event->x, event->y);
+  }
+}
+
+static void handle_xwayland_request_activate(struct wl_listener *listener, void *data) {
+  (void)data;
+  struct wlrlean_xwayland_view *view = wl_container_of(listener, view, request_activate);
+  focus_xwayland_view(view->comp, view);
+}
+
+static void handle_xwayland_associate(struct wl_listener *listener, void *data) {
+  (void)data;
+  struct wlrlean_xwayland_view *view = wl_container_of(listener, view, associate);
+  if (!view || !view->xsurface || !view->xsurface->surface || view->associated) {
+    return;
+  }
+
+  view->associated = true;
+  view->scene_tree = wlr_scene_tree_create(view->comp->workspace_tree);
+  if (!view->scene_tree) {
+    return;
+  }
+  struct wlr_scene_surface *scene_surface = wlr_scene_surface_create(view->scene_tree, view->xsurface->surface);
+  if (!scene_surface) {
+    wlr_scene_node_destroy(&view->scene_tree->node);
+    view->scene_tree = NULL;
+    return;
+  }
+  wlr_scene_node_set_position(&view->scene_tree->node, view->xsurface->x, view->xsurface->y);
+  wlr_scene_node_set_enabled(&view->scene_tree->node, false);
+
+  view->map.notify = handle_xwayland_surface_map;
+  wl_signal_add(&view->xsurface->surface->events.map, &view->map);
+  view->unmap.notify = handle_xwayland_surface_unmap;
+  wl_signal_add(&view->xsurface->surface->events.unmap, &view->unmap);
+}
+
+static void handle_xwayland_dissociate(struct wl_listener *listener, void *data) {
+  (void)data;
+  struct wlrlean_xwayland_view *view = wl_container_of(listener, view, dissociate);
+  view->associated = false;
+  view->mapped = false;
+  if (view->map.link.prev && view->map.link.next) {
+    wl_list_remove(&view->map.link);
+  }
+  if (view->unmap.link.prev && view->unmap.link.next) {
+    wl_list_remove(&view->unmap.link);
+  }
+  if (view->scene_tree) {
+    wlr_scene_node_destroy(&view->scene_tree->node);
+    view->scene_tree = NULL;
+  }
+}
+
+static void handle_xwayland_destroy(struct wl_listener *listener, void *data) {
+  (void)data;
+  struct wlrlean_xwayland_view *view = wl_container_of(listener, view, destroy);
+  wl_list_remove(&view->link);
+  if (view->associate.link.prev && view->associate.link.next) {
+    wl_list_remove(&view->associate.link);
+  }
+  if (view->dissociate.link.prev && view->dissociate.link.next) {
+    wl_list_remove(&view->dissociate.link);
+  }
+  if (view->set_geometry.link.prev && view->set_geometry.link.next) {
+    wl_list_remove(&view->set_geometry.link);
+  }
+  if (view->request_configure.link.prev && view->request_configure.link.next) {
+    wl_list_remove(&view->request_configure.link);
+  }
+  if (view->request_activate.link.prev && view->request_activate.link.next) {
+    wl_list_remove(&view->request_activate.link);
+  }
+  if (view->destroy.link.prev && view->destroy.link.next) {
+    wl_list_remove(&view->destroy.link);
+  }
+  if (view->scene_tree) {
+    wlr_scene_node_destroy(&view->scene_tree->node);
+  }
+  if (view->comp->focused_xwayland_view == view) {
+    view->comp->focused_xwayland_view = NULL;
+  }
+  free(view);
+}
+
+static void handle_new_xwayland_surface(struct wl_listener *listener, void *data) {
+  struct compositor *comp = wl_container_of(listener, comp, new_xwayland_surface);
+  struct wlr_xwayland_surface *xsurface = data;
+  if (!comp || !xsurface) {
+    return;
+  }
+
+  struct wlrlean_xwayland_view *view = calloc(1, sizeof(*view));
+  if (!view) {
+    return;
+  }
+  view->comp = comp;
+  view->xsurface = xsurface;
+  view->id = ++comp->next_surface_id;
+
+  view->associate.notify = handle_xwayland_associate;
+  wl_signal_add(&xsurface->events.associate, &view->associate);
+  view->dissociate.notify = handle_xwayland_dissociate;
+  wl_signal_add(&xsurface->events.dissociate, &view->dissociate);
+  view->set_geometry.notify = handle_xwayland_set_geometry;
+  wl_signal_add(&xsurface->events.set_geometry, &view->set_geometry);
+  view->request_configure.notify = handle_xwayland_request_configure;
+  wl_signal_add(&xsurface->events.request_configure, &view->request_configure);
+  view->request_activate.notify = handle_xwayland_request_activate;
+  wl_signal_add(&xsurface->events.request_activate, &view->request_activate);
+  view->destroy.notify = handle_xwayland_destroy;
+  wl_signal_add(&xsurface->events.destroy, &view->destroy);
+
+  wl_list_insert(&comp->xwayland_views, &view->link);
+  if (xsurface->surface) {
+    handle_xwayland_associate(&view->associate, NULL);
+  }
+}
+
+static void handle_xwayland_ready(struct wl_listener *listener, void *data) {
+  (void)data;
+  struct compositor *comp = wl_container_of(listener, comp, xwayland_ready);
+  if (!comp || !comp->xwayland || !comp->xwayland->display_name) {
+    return;
+  }
+  setenv("DISPLAY", comp->xwayland->display_name, 1);
+  fprintf(stderr, "[c] xwayland ready display=%s\n", comp->xwayland->display_name);
+}
+#endif
 
 static void handle_output_frame(struct wl_listener *listener, void *data) {
   (void)data;
@@ -791,6 +1302,10 @@ static void handle_output_destroy(struct wl_listener *listener, void *data) {
   wl_list_remove(&output->frame.link);
   wl_list_remove(&output->destroy.link);
   free(output);
+  if (comp->destroying) {
+    return;
+  }
+  arrange_layer_surfaces(comp);
   push_output_size_if_changed(comp);
 }
 
@@ -851,6 +1366,7 @@ static void handle_new_output(struct wl_listener *listener, void *data) {
     (void)wlr_xcursor_manager_load(comp->cursor_mgr, scale);
     set_default_cursor(comp);
   }
+  arrange_layer_surfaces(comp);
 
   uint64_t id = ++comp->next_output_id;
   fprintf(stderr, "[c] new_output id=%" PRIu64 "\n", id);
@@ -976,6 +1492,8 @@ compositor_t *comp_create(void) {
 
   wl_list_init(&comp->outputs);
   wl_list_init(&comp->views);
+  wl_list_init(&comp->xwayland_views);
+  wl_list_init(&comp->layer_surfaces);
   wl_list_init(&comp->keyboards);
   comp->pointer_focus_mode = POINTER_FOCUS_CLICK;
   install_sigchld_reaper();
@@ -1039,6 +1557,18 @@ compositor_t *comp_create(void) {
     return NULL;
   }
 
+  comp->background_tree = wlr_scene_tree_create(&comp->scene->tree);
+  comp->bottom_tree = wlr_scene_tree_create(&comp->scene->tree);
+  comp->workspace_tree = wlr_scene_tree_create(&comp->scene->tree);
+  comp->top_tree = wlr_scene_tree_create(&comp->scene->tree);
+  comp->overlay_tree = wlr_scene_tree_create(&comp->scene->tree);
+  if (!comp->background_tree || !comp->bottom_tree || !comp->workspace_tree || !comp->top_tree || !comp->overlay_tree) {
+    fprintf(stderr, "[c] comp_create: failed to create scene layer trees\n");
+    wl_display_destroy(comp->display);
+    free(comp);
+    return NULL;
+  }
+
   comp->cursor = wlr_cursor_create();
   if (!comp->cursor) {
     fprintf(stderr, "[c] comp_create: wlr_cursor_create failed\n");
@@ -1070,6 +1600,22 @@ compositor_t *comp_create(void) {
     free(comp);
     return NULL;
   }
+  comp->layer_shell = wlr_layer_shell_v1_create(comp->display, 4);
+  if (!comp->layer_shell) {
+    fprintf(stderr, "[c] comp_create: wlr_layer_shell_v1_create failed\n");
+    wl_display_destroy(comp->display);
+    free(comp);
+    return NULL;
+  }
+
+#if WLRLEAN_HAS_XWAYLAND
+  comp->xwayland = wlr_xwayland_create(comp->display, comp->wlr_compositor, false);
+  if (!comp->xwayland) {
+    fprintf(stderr, "[c] comp_create: wlr_xwayland_create failed (X11 apps unavailable)\n");
+  } else {
+    wlr_xwayland_set_seat(comp->xwayland, comp->seat);
+  }
+#endif
 
   comp->new_output.notify = handle_new_output;
   wl_signal_add(&comp->backend->events.new_output, &comp->new_output);
@@ -1081,6 +1627,18 @@ compositor_t *comp_create(void) {
   wl_signal_add(&comp->xdg_shell->events.new_surface, &comp->new_xdg_surface);
   comp->new_xdg_toplevel.notify = handle_new_xdg_toplevel;
   wl_signal_add(&comp->xdg_shell->events.new_toplevel, &comp->new_xdg_toplevel);
+
+  comp->new_layer_surface.notify = handle_new_layer_surface;
+  wl_signal_add(&comp->layer_shell->events.new_surface, &comp->new_layer_surface);
+
+  if (comp->xwayland) {
+#if WLRLEAN_HAS_XWAYLAND
+    comp->new_xwayland_surface.notify = handle_new_xwayland_surface;
+    wl_signal_add(&comp->xwayland->events.new_surface, &comp->new_xwayland_surface);
+    comp->xwayland_ready.notify = handle_xwayland_ready;
+    wl_signal_add(&comp->xwayland->events.ready, &comp->xwayland_ready);
+#endif
+  }
 
   comp->request_cursor.notify = handle_request_cursor;
   wl_signal_add(&comp->seat->events.request_set_cursor, &comp->request_cursor);
@@ -1120,6 +1678,11 @@ int comp_start(compositor_t *base) {
   }
 
   setenv("WAYLAND_DISPLAY", socket_name, 1);
+#if WLRLEAN_HAS_XWAYLAND
+  if (comp->xwayland && comp->xwayland->display_name) {
+    setenv("DISPLAY", comp->xwayland->display_name, 1);
+  }
+#endif
   // Ensure spawned clients don't keep using a parent compositor socket FD.
   unsetenv("WAYLAND_SOCKET");
 
@@ -1205,6 +1768,11 @@ int comp_apply_cmds(compositor_t *base, const cmd_t *cmds, size_t n) {
       if (comp->focused_view && comp->focused_view->xdg_surface && comp->focused_view->xdg_surface->toplevel) {
         wlr_xdg_toplevel_send_close(comp->focused_view->xdg_surface->toplevel);
       }
+#if WLRLEAN_HAS_XWAYLAND
+      else if (comp->focused_xwayland_view && comp->focused_xwayland_view->xsurface) {
+        wlr_xwayland_surface_close(comp->focused_xwayland_view->xsurface);
+      }
+#endif
       break;
     default:
       break;
@@ -1236,6 +1804,9 @@ void comp_destroy(compositor_t *base) {
   comp->destroying = true;
 
   if (comp->display) {
+    remove_listener_if_linked(&comp->new_layer_surface);
+    remove_listener_if_linked(&comp->new_xwayland_surface);
+    remove_listener_if_linked(&comp->xwayland_ready);
     remove_listener_if_linked(&comp->request_cursor);
     remove_listener_if_linked(&comp->cursor_motion);
     remove_listener_if_linked(&comp->cursor_motion_absolute);
@@ -1246,6 +1817,12 @@ void comp_destroy(compositor_t *base) {
     remove_listener_if_linked(&comp->new_input);
     remove_listener_if_linked(&comp->new_xdg_surface);
     remove_listener_if_linked(&comp->new_xdg_toplevel);
+    if (comp->xwayland) {
+#if WLRLEAN_HAS_XWAYLAND
+      wlr_xwayland_destroy(comp->xwayland);
+#endif
+      comp->xwayland = NULL;
+    }
     if (comp->cursor) {
       wlr_cursor_destroy(comp->cursor);
       comp->cursor = NULL;
@@ -1367,27 +1944,48 @@ LEAN_EXPORT lean_obj_res lean_comp_cmd_set_rect(uint64_t handle, uint64_t id, ui
   (void)world;
   struct compositor *comp = comp_from_handle(handle);
   struct wlrlean_view *view = find_view_by_id(comp, id);
-  if (!view || !view->mapped || !view->xdg_surface || !view->xdg_surface->toplevel) {
-    return lean_io_result_mk_ok(lean_box_uint32(1));
+  if (view && view->mapped && view->xdg_surface && view->xdg_surface->toplevel) {
+    wlr_scene_node_set_position(&view->scene_tree->node, (int)x, (int)y);
+    wlr_xdg_toplevel_set_size(view->xdg_surface->toplevel, (int)w, (int)h);
+    wlr_xdg_toplevel_set_tiled(view->xdg_surface->toplevel, WLR_EDGE_LEFT | WLR_EDGE_RIGHT | WLR_EDGE_TOP |
+                                                           WLR_EDGE_BOTTOM);
+    wlr_xdg_surface_schedule_configure(view->xdg_surface);
+    return lean_io_result_mk_ok(lean_box_uint32(0));
   }
 
-  wlr_scene_node_set_position(&view->scene_tree->node, (int)x, (int)y);
-  wlr_xdg_toplevel_set_size(view->xdg_surface->toplevel, (int)w, (int)h);
-  wlr_xdg_toplevel_set_tiled(view->xdg_surface->toplevel, WLR_EDGE_LEFT | WLR_EDGE_RIGHT | WLR_EDGE_TOP |
-                                                         WLR_EDGE_BOTTOM);
-  wlr_xdg_surface_schedule_configure(view->xdg_surface);
-  return lean_io_result_mk_ok(lean_box_uint32(0));
+  struct wlrlean_xwayland_view *xview = find_xwayland_view_by_id(comp, id);
+#if WLRLEAN_HAS_XWAYLAND
+  if (xview && xview->mapped && xview->xsurface) {
+    wlr_xwayland_surface_configure(xview->xsurface, (int)x, (int)y, (int)w, (int)h);
+    if (xview->scene_tree) {
+      wlr_scene_node_set_position(&xview->scene_tree->node, (int)x, (int)y);
+    }
+    return lean_io_result_mk_ok(lean_box_uint32(0));
+  }
+#else
+  (void)xview;
+#endif
+  return lean_io_result_mk_ok(lean_box_uint32(1));
 }
 
 LEAN_EXPORT lean_obj_res lean_comp_cmd_focus_id(uint64_t handle, uint64_t id, b_lean_obj_arg world) {
   (void)world;
   struct compositor *comp = comp_from_handle(handle);
   struct wlrlean_view *view = find_view_by_id(comp, id);
-  if (!view || !view->mapped || !view->xdg_surface || !view->xdg_surface->toplevel) {
-    return lean_io_result_mk_ok(lean_box_uint32(1));
+  if (view && view->mapped && view->xdg_surface && view->xdg_surface->toplevel) {
+    focus_view(comp, view);
+    return lean_io_result_mk_ok(lean_box_uint32(0));
   }
-  focus_view(comp, view);
-  return lean_io_result_mk_ok(lean_box_uint32(0));
+  struct wlrlean_xwayland_view *xview = find_xwayland_view_by_id(comp, id);
+#if WLRLEAN_HAS_XWAYLAND
+  if (xview && xview->mapped && xview->xsurface) {
+    focus_xwayland_view(comp, xview);
+    return lean_io_result_mk_ok(lean_box_uint32(0));
+  }
+#else
+  (void)xview;
+#endif
+  return lean_io_result_mk_ok(lean_box_uint32(1));
 }
 
 LEAN_EXPORT lean_obj_res lean_comp_destroy(uint64_t handle, b_lean_obj_arg w) {

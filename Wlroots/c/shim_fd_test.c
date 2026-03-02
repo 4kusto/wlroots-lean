@@ -110,30 +110,10 @@ fail:
 }
 
 int main(void) {
-  if (getenv("FD_TEST_NO_FORK")) {
-    return run_fd_balance_case();
-  }
-
-  pid_t pid = fork();
-  if (pid < 0) {
-    perror("fork");
+  int rc = run_fd_balance_case();
+  if (rc != 0) {
     return 1;
   }
-  if (pid == 0) {
-    _exit(run_fd_balance_case());
-  }
-
-  int status = 0;
-  if (waitpid(pid, &status, 0) < 0) {
-    perror("waitpid");
-    return 1;
-  }
-
-  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-    fprintf(stderr, "fd test child failed (status=%d)\n", status);
-    return 1;
-  }
-
   puts("fd lifecycle test passed");
   return 0;
 }
