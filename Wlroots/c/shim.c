@@ -23,14 +23,17 @@
 #include <wlr/render/allocator.h>
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/types/wlr_compositor.h>
+#include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_data_device.h>
 #include <wlr/types/wlr_input_device.h>
 #include <wlr/types/wlr_keyboard.h>
 #include <wlr/types/wlr_output.h>
 #include <wlr/types/wlr_output_layout.h>
+#include <wlr/types/wlr_pointer.h>
 #include <wlr/types/wlr_scene.h>
 #include <wlr/types/wlr_seat.h>
 #include <wlr/types/wlr_subcompositor.h>
+#include <wlr/types/wlr_xcursor_manager.h>
 #include <wlr/types/wlr_xdg_shell.h>
 #include <wlr/util/edges.h>
 #include <wlr/util/log.h>
@@ -93,6 +96,8 @@ struct compositor {
 
   struct wlr_output_layout *output_layout;
   struct wlr_scene *scene;
+  struct wlr_cursor *cursor;
+  struct wlr_xcursor_manager *cursor_mgr;
 
   struct wlr_seat *seat;
   struct wlr_xdg_shell *xdg_shell;
@@ -101,6 +106,13 @@ struct compositor {
   struct wl_listener new_input;
   struct wl_listener new_xdg_surface;
   struct wl_listener new_xdg_toplevel;
+  struct wl_listener request_cursor;
+
+  struct wl_listener cursor_motion;
+  struct wl_listener cursor_motion_absolute;
+  struct wl_listener cursor_button;
+  struct wl_listener cursor_axis;
+  struct wl_listener cursor_frame;
 
   struct wl_list outputs;   // struct wlrlean_output::link
   struct wl_list views;     // struct wlrlean_view::link
@@ -108,6 +120,7 @@ struct compositor {
 
   struct wlrlean_view *focused_view;
   bool destroying;
+  uint32_t pointer_focus_mode;
 
   event_t evq[EVQ_CAP];
   size_t evq_head;
@@ -414,6 +427,9 @@ static int spawn_by_id(struct compositor *comp, uint64_t app_id) {
 static void focus_view(struct compositor *comp, struct wlrlean_view *view);
 static void maybe_setup_toplevel(struct wlrlean_view *view);
 static struct wlrlean_view *find_view_by_id(struct compositor *comp, uint64_t id);
+static void process_cursor_motion(struct compositor *comp, uint32_t time_msec);
+static struct wlrlean_view *view_at_cursor(struct compositor *comp);
+static void set_default_cursor(struct compositor *comp);
 
 static struct wlrlean_keyboard *first_keyboard(struct compositor *comp) {
   if (wl_list_empty(&comp->keyboards)) {
@@ -424,10 +440,157 @@ static struct wlrlean_keyboard *first_keyboard(struct compositor *comp) {
 
 static void update_seat_capabilities(struct compositor *comp) {
   uint32_t caps = 0;
+  if (comp->cursor) {
+    caps |= WL_SEAT_CAPABILITY_POINTER;
+  }
   if (!wl_list_empty(&comp->keyboards)) {
     caps |= WL_SEAT_CAPABILITY_KEYBOARD;
   }
   wlr_seat_set_capabilities(comp->seat, caps);
+}
+
+static void set_default_cursor(struct compositor *comp) {
+  if (!comp || !comp->cursor || !comp->cursor_mgr) {
+    return;
+  }
+  wlr_cursor_set_xcursor(comp->cursor, comp->cursor_mgr, "left_ptr");
+}
+
+static struct wlr_surface *surface_at_cursor(struct compositor *comp, double *sx, double *sy) {
+  if (!comp || !comp->cursor || !comp->scene) {
+    return NULL;
+  }
+
+  struct wlr_scene_node *node = wlr_scene_node_at(&comp->scene->tree.node, comp->cursor->x, comp->cursor->y, sx, sy);
+  if (!node || node->type != WLR_SCENE_NODE_BUFFER) {
+    return NULL;
+  }
+
+  struct wlr_scene_buffer *scene_buffer = wlr_scene_buffer_from_node(node);
+  if (!scene_buffer) {
+    return NULL;
+  }
+  struct wlr_scene_surface *scene_surface = wlr_scene_surface_try_from_buffer(scene_buffer);
+  if (!scene_surface) {
+    return NULL;
+  }
+  return scene_surface->surface;
+}
+
+static struct wlrlean_view *view_at_cursor(struct compositor *comp) {
+  double sx = 0, sy = 0;
+  struct wlr_surface *surface = surface_at_cursor(comp, &sx, &sy);
+  if (!surface) {
+    return NULL;
+  }
+
+  struct wlr_surface *root = wlr_surface_get_root_surface(surface);
+  struct wlr_xdg_surface *xdg_surface = wlr_xdg_surface_try_from_wlr_surface(root);
+  if (!xdg_surface || xdg_surface->role != WLR_XDG_SURFACE_ROLE_TOPLEVEL) {
+    return NULL;
+  }
+
+  struct wlrlean_view *view;
+  wl_list_for_each(view, &comp->views, link) {
+    if (view->xdg_surface == xdg_surface) {
+      return view;
+    }
+  }
+  return NULL;
+}
+
+static void process_cursor_motion(struct compositor *comp, uint32_t time_msec) {
+  if (!comp || !comp->seat) {
+    return;
+  }
+
+  double sx = 0, sy = 0;
+  struct wlr_surface *surface = surface_at_cursor(comp, &sx, &sy);
+  if (!surface) {
+    wlr_seat_pointer_notify_clear_focus(comp->seat);
+    set_default_cursor(comp);
+    return;
+  }
+
+  wlr_seat_pointer_notify_enter(comp->seat, surface, sx, sy);
+  wlr_seat_pointer_notify_motion(comp->seat, time_msec, sx, sy);
+  if (comp->pointer_focus_mode == POINTER_FOCUS_HOVER) {
+    struct wlrlean_view *view = view_at_cursor(comp);
+    if (view) {
+      focus_view(comp, view);
+    }
+  }
+}
+
+static void handle_request_cursor(struct wl_listener *listener, void *data) {
+  struct compositor *comp = wl_container_of(listener, comp, request_cursor);
+  struct wlr_seat_pointer_request_set_cursor_event *event = data;
+  if (!comp || !comp->cursor || !event) {
+    return;
+  }
+
+  if (comp->seat->pointer_state.focused_client == event->seat_client) {
+    wlr_cursor_set_surface(comp->cursor, event->surface, event->hotspot_x, event->hotspot_y);
+  }
+}
+
+static void handle_cursor_motion(struct wl_listener *listener, void *data) {
+  struct compositor *comp = wl_container_of(listener, comp, cursor_motion);
+  struct wlr_pointer_motion_event *event = data;
+  if (!comp || !comp->cursor || !event) {
+    return;
+  }
+
+  wlr_cursor_move(comp->cursor, &event->pointer->base, event->delta_x, event->delta_y);
+  process_cursor_motion(comp, event->time_msec);
+}
+
+static void handle_cursor_motion_absolute(struct wl_listener *listener, void *data) {
+  struct compositor *comp = wl_container_of(listener, comp, cursor_motion_absolute);
+  struct wlr_pointer_motion_absolute_event *event = data;
+  if (!comp || !comp->cursor || !event) {
+    return;
+  }
+
+  wlr_cursor_warp_absolute(comp->cursor, &event->pointer->base, event->x, event->y);
+  process_cursor_motion(comp, event->time_msec);
+}
+
+static void handle_cursor_button(struct wl_listener *listener, void *data) {
+  struct compositor *comp = wl_container_of(listener, comp, cursor_button);
+  struct wlr_pointer_button_event *event = data;
+  if (!comp || !comp->seat || !event) {
+    return;
+  }
+
+  process_cursor_motion(comp, event->time_msec);
+  wlr_seat_pointer_notify_button(comp->seat, event->time_msec, event->button, event->state);
+  if (comp->pointer_focus_mode == POINTER_FOCUS_CLICK && event->state == WL_POINTER_BUTTON_STATE_PRESSED) {
+    struct wlrlean_view *view = view_at_cursor(comp);
+    if (view) {
+      focus_view(comp, view);
+    }
+  }
+}
+
+static void handle_cursor_axis(struct wl_listener *listener, void *data) {
+  struct compositor *comp = wl_container_of(listener, comp, cursor_axis);
+  struct wlr_pointer_axis_event *event = data;
+  if (!comp || !comp->seat || !event) {
+    return;
+  }
+
+  wlr_seat_pointer_notify_axis(comp->seat, event->time_msec, event->orientation, event->delta, event->delta_discrete,
+                               event->source, event->relative_direction);
+}
+
+static void handle_cursor_frame(struct wl_listener *listener, void *data) {
+  (void)data;
+  struct compositor *comp = wl_container_of(listener, comp, cursor_frame);
+  if (!comp || !comp->seat) {
+    return;
+  }
+  wlr_seat_pointer_notify_frame(comp->seat);
 }
 
 static void focus_view(struct compositor *comp, struct wlrlean_view *view) {
@@ -683,6 +846,11 @@ static void handle_new_output(struct wl_listener *listener, void *data) {
 
   wl_list_insert(&comp->outputs, &toutput->link);
   wlr_output_layout_add_auto(comp->output_layout, output);
+  if (comp->cursor_mgr) {
+    float scale = output->scale > 0.f ? output->scale : 1.f;
+    (void)wlr_xcursor_manager_load(comp->cursor_mgr, scale);
+    set_default_cursor(comp);
+  }
 
   uint64_t id = ++comp->next_output_id;
   fprintf(stderr, "[c] new_output id=%" PRIu64 "\n", id);
@@ -739,6 +907,14 @@ static void handle_keyboard_destroy(struct wl_listener *listener, void *data) {
 static void handle_new_input(struct wl_listener *listener, void *data) {
   struct compositor *comp = wl_container_of(listener, comp, new_input);
   struct wlr_input_device *device = data;
+
+  if (device->type == WLR_INPUT_DEVICE_POINTER) {
+    if (comp->cursor) {
+      wlr_cursor_attach_input_device(comp->cursor, device);
+      update_seat_capabilities(comp);
+    }
+    return;
+  }
 
   if (device->type != WLR_INPUT_DEVICE_KEYBOARD) {
     return;
@@ -801,6 +977,7 @@ compositor_t *comp_create(void) {
   wl_list_init(&comp->outputs);
   wl_list_init(&comp->views);
   wl_list_init(&comp->keyboards);
+  comp->pointer_focus_mode = POINTER_FOCUS_CLICK;
   install_sigchld_reaper();
 
   comp->display = wl_display_create();
@@ -862,6 +1039,23 @@ compositor_t *comp_create(void) {
     return NULL;
   }
 
+  comp->cursor = wlr_cursor_create();
+  if (!comp->cursor) {
+    fprintf(stderr, "[c] comp_create: wlr_cursor_create failed\n");
+    wl_display_destroy(comp->display);
+    free(comp);
+    return NULL;
+  }
+  wlr_cursor_attach_output_layout(comp->cursor, comp->output_layout);
+
+  comp->cursor_mgr = wlr_xcursor_manager_create(NULL, 24);
+  if (!comp->cursor_mgr) {
+    fprintf(stderr, "[c] comp_create: wlr_xcursor_manager_create failed\n");
+  } else {
+    (void)wlr_xcursor_manager_load(comp->cursor_mgr, 1.f);
+    set_default_cursor(comp);
+  }
+
   comp->seat = wlr_seat_create(comp->display, "seat0");
   if (!comp->seat) {
     fprintf(stderr, "[c] comp_create: wlr_seat_create failed\n");
@@ -887,6 +1081,26 @@ compositor_t *comp_create(void) {
   wl_signal_add(&comp->xdg_shell->events.new_surface, &comp->new_xdg_surface);
   comp->new_xdg_toplevel.notify = handle_new_xdg_toplevel;
   wl_signal_add(&comp->xdg_shell->events.new_toplevel, &comp->new_xdg_toplevel);
+
+  comp->request_cursor.notify = handle_request_cursor;
+  wl_signal_add(&comp->seat->events.request_set_cursor, &comp->request_cursor);
+
+  comp->cursor_motion.notify = handle_cursor_motion;
+  wl_signal_add(&comp->cursor->events.motion, &comp->cursor_motion);
+
+  comp->cursor_motion_absolute.notify = handle_cursor_motion_absolute;
+  wl_signal_add(&comp->cursor->events.motion_absolute, &comp->cursor_motion_absolute);
+
+  comp->cursor_button.notify = handle_cursor_button;
+  wl_signal_add(&comp->cursor->events.button, &comp->cursor_button);
+
+  comp->cursor_axis.notify = handle_cursor_axis;
+  wl_signal_add(&comp->cursor->events.axis, &comp->cursor_axis);
+
+  comp->cursor_frame.notify = handle_cursor_frame;
+  wl_signal_add(&comp->cursor->events.frame, &comp->cursor_frame);
+
+  update_seat_capabilities(comp);
 
   fprintf(stderr, "[c] comp_create: ok (build=2026-02-21c)\n");
   return comp;
@@ -1000,6 +1214,18 @@ int comp_apply_cmds(compositor_t *base, const cmd_t *cmds, size_t n) {
   return rc;
 }
 
+int comp_set_pointer_focus_mode(compositor_t *base, uint32_t mode) {
+  struct compositor *comp = base;
+  if (!comp) {
+    return -1;
+  }
+  if (mode != POINTER_FOCUS_CLICK && mode != POINTER_FOCUS_HOVER) {
+    return -1;
+  }
+  comp->pointer_focus_mode = mode;
+  return 0;
+}
+
 void comp_destroy(compositor_t *base) {
   struct compositor *comp = base;
   if (!comp) {
@@ -1010,10 +1236,24 @@ void comp_destroy(compositor_t *base) {
   comp->destroying = true;
 
   if (comp->display) {
+    remove_listener_if_linked(&comp->request_cursor);
+    remove_listener_if_linked(&comp->cursor_motion);
+    remove_listener_if_linked(&comp->cursor_motion_absolute);
+    remove_listener_if_linked(&comp->cursor_button);
+    remove_listener_if_linked(&comp->cursor_axis);
+    remove_listener_if_linked(&comp->cursor_frame);
     remove_listener_if_linked(&comp->new_output);
     remove_listener_if_linked(&comp->new_input);
     remove_listener_if_linked(&comp->new_xdg_surface);
     remove_listener_if_linked(&comp->new_xdg_toplevel);
+    if (comp->cursor) {
+      wlr_cursor_destroy(comp->cursor);
+      comp->cursor = NULL;
+    }
+    if (comp->cursor_mgr) {
+      wlr_xcursor_manager_destroy(comp->cursor_mgr);
+      comp->cursor_mgr = NULL;
+    }
     wl_display_destroy_clients(comp->display);
     wl_display_destroy(comp->display);
   }
@@ -1154,5 +1394,12 @@ LEAN_EXPORT lean_obj_res lean_comp_destroy(uint64_t handle, b_lean_obj_arg w) {
   (void)w;
   comp_destroy(comp_from_handle(handle));
   return lean_io_result_mk_ok(lean_box(0));
+}
+
+LEAN_EXPORT lean_obj_res lean_comp_set_pointer_focus_mode(uint64_t handle, uint32_t mode, b_lean_obj_arg w) {
+  (void)w;
+  int rc = comp_set_pointer_focus_mode(comp_from_handle(handle), mode);
+  uint32_t out = (rc == 0) ? 0u : 1u;
+  return lean_io_result_mk_ok(lean_box_uint32(out));
 }
 #endif

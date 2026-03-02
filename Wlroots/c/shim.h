@@ -48,11 +48,17 @@ enum cmd_tag {
   CMD_FOCUS_ID = 5
 };
 
+enum pointer_focus_mode {
+  POINTER_FOCUS_CLICK = 0,
+  POINTER_FOCUS_HOVER = 1
+};
+
 compositor_t *comp_create(void);
 int comp_start(compositor_t *comp);
 void comp_run_once(compositor_t *comp);
 int comp_poll_event(compositor_t *comp, event_t *out);
 int comp_apply_cmds(compositor_t *comp, const cmd_t *cmds, size_t n);
+int comp_set_pointer_focus_mode(compositor_t *comp, uint32_t mode);
 void comp_destroy(compositor_t *comp);
 
 #endif

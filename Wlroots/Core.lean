@@ -382,4 +382,22 @@ def handleEvent (st : WMState) (ev : Event) : WMState × Array Cmd :=
       | some a => applyAction st a
       | none => ({ st with lastEvent := s!"key(mods={mods},sym={sym})" }, #[])
 
+def handleEvents (st : WMState) (events : Array Event) : WMState × Array Cmd :=
+  Id.run do
+    let mut curr := st
+    let mut cmds : Array Cmd := #[]
+    for ev in events do
+      let (next, out) := handleEvent curr ev
+      curr := next
+      cmds := cmds ++ out
+    return (curr, cmds)
+
+def runStep (h : Handle) (st : WMState) (maxEvents : Nat := 256) :
+    IO (WMState × Array Event × Array Cmd × Array UInt32) := do
+  compRunOnce h
+  let events ← pollEvents h maxEvents
+  let (st', cmds) := handleEvents st events
+  let results ← applyCmds h cmds
+  pure (st', events, cmds, results)
+
 end Wlroots

@@ -19,6 +19,8 @@ inductive Cmd where
   | closeFocused
   | setRect (id : UInt64) (x : UInt32) (y : UInt32) (w : UInt32) (h : UInt32)
   | focusId (id : UInt64)
+  | pointerFocusClick
+  | pointerFocusHover
   deriving Repr
 
 abbrev Handle := UInt64
@@ -68,6 +70,9 @@ opaque compCmdFocusId : Handle → UInt64 → IO UInt32
 @[extern "lean_comp_destroy"]
 opaque compDestroy : Handle → IO Unit
 
+@[extern "lean_comp_set_pointer_focus_mode"]
+opaque compSetPointerFocusMode : Handle → UInt32 → IO UInt32
+
 def decodeEvent (tag : UInt32) (a b : UInt64) : Event :=
   if tag == 1 then
     .tick a
@@ -101,6 +106,18 @@ def pollEvent (h : Handle) : IO (Option Event) := do
   else
     some <$> readEvent h
 
+def pollEvents (h : Handle) (maxEvents : Nat := 256) : IO (Array Event) := do
+  let mut out : Array Event := #[]
+  let mut n := 0
+  while n < maxEvents do
+    let ev? ← pollEvent h
+    match ev? with
+    | none => break
+    | some ev =>
+        out := out.push ev
+        n := n + 1
+  pure out
+
 def applyCmd (h : Handle) (cmd : Cmd) : IO UInt32 :=
   match cmd with
   | .noop => compApplyNoCmds h
@@ -114,5 +131,13 @@ def applyCmd (h : Handle) (cmd : Cmd) : IO UInt32 :=
   | .closeFocused => compCmdCloseFocused h
   | .setRect id x y w h' => compCmdSetRect h id x y w h'
   | .focusId id => compCmdFocusId h id
+  | .pointerFocusClick => compSetPointerFocusMode h 0
+  | .pointerFocusHover => compSetPointerFocusMode h 1
+
+def applyCmds (h : Handle) (cmds : Array Cmd) : IO (Array UInt32) := do
+  let mut out : Array UInt32 := #[]
+  for cmd in cmds do
+    out := out.push (← applyCmd h cmd)
+  pure out
 
 end Wlroots
