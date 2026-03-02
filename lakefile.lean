@@ -67,3 +67,15 @@ extern_lib leanshim (pkg : NPackage __name__) := do
 
   let libFile : FilePath := buildCDir / nameToStaticLib "leanshim"
   JobM.runSpawnM <| buildStaticLib libFile #[jOShim]
+
+@[test_driver]
+script test (_args) do
+  let child ← IO.Process.spawn {
+    cmd := "sh"
+    args := #[
+      "-lc",
+      "env -u CC -u LEAN_CC make check"
+    ]
+  }
+  let exitCode ← child.wait
+  pure exitCode

@@ -2,7 +2,9 @@
 #include "shim.h"
 
 #include <inttypes.h>
+#ifndef SHIM_NO_LEAN_FFI
 #include <lean/lean.h>
+#endif
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -10,7 +12,9 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <signal.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 
 #include <wayland-server-core.h>
 #include <wayland-server-protocol.h>
@@ -103,6 +107,7 @@ struct compositor {
   struct wl_list keyboards; // struct wlrlean_keyboard::link
 
   struct wlrlean_view *focused_view;
+  bool destroying;
 
   event_t evq[EVQ_CAP];
   size_t evq_head;
@@ -226,7 +231,7 @@ static void push_event(struct compositor *comp, uint32_t tag, uint64_t a, uint64
 }
 
 static void push_output_size_if_changed(struct compositor *comp) {
-  if (!comp || !comp->output_layout) {
+  if (!comp || comp->destroying || !comp->output_layout) {
     return;
   }
   struct wlr_box box = {0};
@@ -257,6 +262,49 @@ static int pop_event(struct compositor *comp, event_t *out) {
   return 1;
 }
 
+static void remove_listener_if_linked(struct wl_listener *listener) {
+  if (!listener) {
+    return;
+  }
+  if (listener->link.prev && listener->link.next) {
+    wl_list_remove(&listener->link);
+    listener->link.prev = NULL;
+    listener->link.next = NULL;
+  }
+}
+
+static void close_extra_fds_in_child(void) {
+  long max_fd = sysconf(_SC_OPEN_MAX);
+  if (max_fd < 0) {
+    max_fd = 1024;
+  }
+  for (int fd = 3; fd < max_fd; fd++) {
+    close(fd);
+  }
+}
+
+static void handle_sigchld(int signo) {
+  (void)signo;
+  while (waitpid(-1, NULL, WNOHANG) > 0) {
+  }
+}
+
+static void install_sigchld_reaper(void) {
+  static bool installed = false;
+  if (installed) {
+    return;
+  }
+  struct sigaction sa = {0};
+  sa.sa_handler = handle_sigchld;
+  sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+  sigemptyset(&sa.sa_mask);
+  if (sigaction(SIGCHLD, &sa, NULL) == 0) {
+    installed = true;
+  } else {
+    fprintf(stderr, "[c] warning: failed to install SIGCHLD handler\n");
+  }
+}
+
 static void spawn_command(const char *cmd) {
   pid_t pid = fork();
   if (pid != 0) {
@@ -268,6 +316,7 @@ static void spawn_command(const char *cmd) {
   // WAYLAND_SOCKET and accidentally connect to the parent compositor.
   // Force children to use WAYLAND_DISPLAY exported by comp_start().
   unsetenv("WAYLAND_SOCKET");
+  close_extra_fds_in_child();
   const char *wd = getenv("WAYLAND_DISPLAY");
   const char *xr = getenv("XDG_RUNTIME_DIR");
   const char *path = getenv("PATH");
@@ -752,6 +801,7 @@ compositor_t *comp_create(void) {
   wl_list_init(&comp->outputs);
   wl_list_init(&comp->views);
   wl_list_init(&comp->keyboards);
+  install_sigchld_reaper();
 
   comp->display = wl_display_create();
   if (!comp->display) {
@@ -907,6 +957,8 @@ int comp_poll_event(compositor_t *base, event_t *out) {
     if (out->tag != EV_TICK || (out->a % 60) == 0) {
       fprintf(stderr, "[c] poll event tag=%u a=%" PRIu64 " b=%" PRIu64 "\n", out->tag, out->a, out->b);
     }
+  } else {
+    memset(&comp->last_event, 0, sizeof(comp->last_event));
   }
   return has;
 }
@@ -955,8 +1007,13 @@ void comp_destroy(compositor_t *base) {
   }
 
   fprintf(stderr, "[c] comp_destroy\n");
+  comp->destroying = true;
 
   if (comp->display) {
+    remove_listener_if_linked(&comp->new_output);
+    remove_listener_if_linked(&comp->new_input);
+    remove_listener_if_linked(&comp->new_xdg_surface);
+    remove_listener_if_linked(&comp->new_xdg_toplevel);
     wl_display_destroy_clients(comp->display);
     wl_display_destroy(comp->display);
   }
@@ -976,6 +1033,7 @@ static compositor_t *comp_from_handle(uint64_t handle) {
   return (compositor_t *)(uintptr_t)handle;
 }
 
+#ifndef SHIM_NO_LEAN_FFI
 LEAN_EXPORT lean_obj_res lean_comp_create(b_lean_obj_arg w) {
   (void)w;
   compositor_t *comp = comp_create();
@@ -985,7 +1043,8 @@ LEAN_EXPORT lean_obj_res lean_comp_create(b_lean_obj_arg w) {
 LEAN_EXPORT lean_obj_res lean_comp_start(uint64_t handle, b_lean_obj_arg w) {
   (void)w;
   int rc = comp_start(comp_from_handle(handle));
-  return lean_io_result_mk_ok(lean_box_uint32((uint32_t)rc));
+  uint32_t out = (rc == 0) ? 0u : 1u;
+  return lean_io_result_mk_ok(lean_box_uint32(out));
 }
 
 LEAN_EXPORT lean_obj_res lean_comp_run_once(uint64_t handle, b_lean_obj_arg w) {
@@ -1027,14 +1086,16 @@ LEAN_EXPORT lean_obj_res lean_comp_last_event_b(uint64_t handle, b_lean_obj_arg 
 LEAN_EXPORT lean_obj_res lean_comp_apply_no_cmds(uint64_t handle, b_lean_obj_arg w) {
   (void)w;
   int rc = comp_apply_cmds(comp_from_handle(handle), NULL, 0);
-  return lean_io_result_mk_ok(lean_box_uint32((uint32_t)rc));
+  uint32_t out = (rc == 0) ? 0u : 1u;
+  return lean_io_result_mk_ok(lean_box_uint32(out));
 }
 
 LEAN_EXPORT lean_obj_res lean_comp_cmd_quit(uint64_t handle, b_lean_obj_arg w) {
   (void)w;
   cmd_t cmd = {.tag = CMD_QUIT, ._pad = 0, .a = 0, .b = 0};
   int rc = comp_apply_cmds(comp_from_handle(handle), &cmd, 1);
-  return lean_io_result_mk_ok(lean_box_uint32((uint32_t)rc));
+  uint32_t out = (rc == 0) ? 0u : 1u;
+  return lean_io_result_mk_ok(lean_box_uint32(out));
 }
 
 LEAN_EXPORT lean_obj_res lean_comp_register_app(uint64_t handle, b_lean_obj_arg command, b_lean_obj_arg w) {
@@ -1049,14 +1110,16 @@ LEAN_EXPORT lean_obj_res lean_comp_cmd_spawn_id(uint64_t handle, uint64_t app_id
   (void)w;
   cmd_t cmd = {.tag = CMD_SPAWN_ID, ._pad = 0, .a = app_id, .b = 0};
   int rc = comp_apply_cmds(comp_from_handle(handle), &cmd, 1);
-  return lean_io_result_mk_ok(lean_box_uint32((uint32_t)rc));
+  uint32_t out = (rc == 0) ? 0u : 1u;
+  return lean_io_result_mk_ok(lean_box_uint32(out));
 }
 
 LEAN_EXPORT lean_obj_res lean_comp_cmd_close_focused(uint64_t handle, b_lean_obj_arg w) {
   (void)w;
   cmd_t cmd = {.tag = CMD_CLOSE_FOCUSED, ._pad = 0, .a = 0, .b = 0};
   int rc = comp_apply_cmds(comp_from_handle(handle), &cmd, 1);
-  return lean_io_result_mk_ok(lean_box_uint32((uint32_t)rc));
+  uint32_t out = (rc == 0) ? 0u : 1u;
+  return lean_io_result_mk_ok(lean_box_uint32(out));
 }
 
 LEAN_EXPORT lean_obj_res lean_comp_cmd_set_rect(uint64_t handle, uint64_t id, uint32_t x, uint32_t y, uint32_t w,
@@ -1065,7 +1128,7 @@ LEAN_EXPORT lean_obj_res lean_comp_cmd_set_rect(uint64_t handle, uint64_t id, ui
   struct compositor *comp = comp_from_handle(handle);
   struct wlrlean_view *view = find_view_by_id(comp, id);
   if (!view || !view->mapped || !view->xdg_surface || !view->xdg_surface->toplevel) {
-    return lean_io_result_mk_ok(lean_box_uint32(0));
+    return lean_io_result_mk_ok(lean_box_uint32(1));
   }
 
   wlr_scene_node_set_position(&view->scene_tree->node, (int)x, (int)y);
@@ -1081,7 +1144,7 @@ LEAN_EXPORT lean_obj_res lean_comp_cmd_focus_id(uint64_t handle, uint64_t id, b_
   struct compositor *comp = comp_from_handle(handle);
   struct wlrlean_view *view = find_view_by_id(comp, id);
   if (!view || !view->mapped || !view->xdg_surface || !view->xdg_surface->toplevel) {
-    return lean_io_result_mk_ok(lean_box_uint32(0));
+    return lean_io_result_mk_ok(lean_box_uint32(1));
   }
   focus_view(comp, view);
   return lean_io_result_mk_ok(lean_box_uint32(0));
@@ -1092,3 +1155,4 @@ LEAN_EXPORT lean_obj_res lean_comp_destroy(uint64_t handle, b_lean_obj_arg w) {
   comp_destroy(comp_from_handle(handle));
   return lean_io_result_mk_ok(lean_box(0));
 }
+#endif

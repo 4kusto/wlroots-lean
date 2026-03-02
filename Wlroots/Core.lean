@@ -71,6 +71,16 @@ private def findPos (cols : Array (Array UInt64)) (id : UInt64) : Option (Nat ×
 private def removeIdFromCols (cols : Array (Array UInt64)) (id : UInt64) : Array (Array UInt64) :=
   removeEmptyCols <| cols.map (fun col => col.filter (fun x => x != id))
 
+private def removeColAt (cols : Array (Array UInt64)) (idx : Nat) : Array (Array UInt64) :=
+  Id.run do
+    let mut out : Array (Array UInt64) := #[]
+    let mut i := 0
+    while i < cols.size do
+      if i != idx then
+        out := out.push cols[i]!
+      i := i + 1
+    return out
+
 private def flattenOrder (cols : Array (Array UInt64)) : Array UInt64 :=
   Id.run do
     let mut out : Array UInt64 := #[]
@@ -223,10 +233,72 @@ private def moveFocused (st : WMState) (dir : WMAction) : WMState :=
                 st
           | _ => st
 
+private def toggleSplitFocused (st : WMState) : WMState :=
+  match st.focus with
+  | none => st
+  | some fid =>
+      match findPos st.cols fid with
+      | none => st
+      | some (ci, _) =>
+          let col := st.cols[ci]!
+          if col.size > 1 then
+            let col' := col.filter (fun x => x != fid)
+            let cols1 := st.cols.set! ci col'
+            { st with cols := insertCol cols1 (ci + 1) #[fid] }
+          else if ci > 0 then
+            let left := st.cols[ci - 1]!
+            let cols1 := st.cols.set! (ci - 1) (left.push fid)
+            { st with cols := removeColAt cols1 ci }
+          else if ci + 1 < st.cols.size then
+            let right := st.cols[ci + 1]!
+            let cols1 := st.cols.set! (ci + 1) (#[fid] ++ right)
+            { st with cols := removeColAt cols1 ci }
+          else
+            st
+
+private def hasMod (mods mask : UInt32) : Bool :=
+  (mods &&& mask) != 0
+
+private def actionOfKey? (mods sym : UInt32) : Option WMAction :=
+  let modLogo : UInt32 := 64
+  let modShift : UInt32 := 1
+  let keyH : UInt32 := 104
+  let keyJ : UInt32 := 106
+  let keyK : UInt32 := 107
+  let keyL : UInt32 := 108
+  let keyQ : UInt32 := 113
+  let keyTab : UInt32 := 65289
+  let keySpace : UInt32 := 32
+  let keyMinus : UInt32 := 45
+  let keyEqual : UInt32 := 61
+  if !hasMod mods modLogo then
+    none
+  else if sym == keyQ then
+    some .closeFocused
+  else if sym == keyTab then
+    if hasMod mods modShift then some .focusPrev else some .focusNext
+  else if sym == keySpace then
+    some .toggleSplit
+  else if sym == keyMinus then
+    some .resizeShrink
+  else if sym == keyEqual then
+    some .resizeGrow
+  else if sym == keyH then
+    some .moveLeft
+  else if sym == keyJ then
+    some .moveDown
+  else if sym == keyK then
+    some .moveUp
+  else if sym == keyL then
+    some .moveRight
+  else
+    none
+
 def applyAction (st : WMState) (a : WMAction) : WMState × Array Cmd :=
   match a with
   | .toggleSplit =>
-      ({ st with lastEvent := "toggleSplit" }, toLayoutCmds st)
+      let st' := toggleSplitFocused st
+      ({ st' with lastEvent := "toggleSplit" }, toLayoutCmds st')
   | .focusPrev =>
       let st' := focusRotate st false
       ({ st' with lastEvent := "focusPrev" }, toLayoutCmds st')
@@ -299,13 +371,15 @@ def handleEvent (st : WMState) (ev : Event) : WMState × Array Cmd :=
         | none => firstId? cols
       let st' := { st with cols, focus, weights := st.weights.erase id, lastEvent := s!"viewUnmap#{id}" }
       (st', toLayoutCmds st')
-  | .key mods sym =>
-      ({ st with lastEvent := s!"key(mods={mods},sym={sym})" }, #[])
   | .backendStarted =>
       ({ st with lastEvent := "backendStarted" }, #[])
   | .backendFailed reason =>
       ({ st with lastEvent := s!"backendFailed(reason={reason})" }, #[])
   | .unknown tag a b =>
       ({ st with lastEvent := s!"unknown(tag={tag},a={a},b={b})" }, #[])
+  | .key mods sym =>
+      match actionOfKey? mods sym with
+      | some a => applyAction st a
+      | none => ({ st with lastEvent := s!"key(mods={mods},sym={sym})" }, #[])
 
 end Wlroots

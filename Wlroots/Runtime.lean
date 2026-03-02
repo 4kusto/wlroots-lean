@@ -94,6 +94,13 @@ def readEvent (h : Handle) : IO Event := do
   let b ← compLastEventB h
   pure <| decodeEvent tag a b
 
+def pollEvent (h : Handle) : IO (Option Event) := do
+  let has ← compPollEvent h
+  if has == 0 then
+    pure none
+  else
+    some <$> readEvent h
+
 def applyCmd (h : Handle) (cmd : Cmd) : IO UInt32 :=
   match cmd with
   | .noop => compApplyNoCmds h
