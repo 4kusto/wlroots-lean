@@ -360,6 +360,96 @@ static void remove_listener_if_linked(struct wl_listener *listener) {
   }
 }
 
+static void cleanup_keyboard_wrappers(struct compositor *comp) {
+  struct wlrlean_keyboard *kbd, *tmp;
+  wl_list_for_each_safe(kbd, tmp, &comp->keyboards, link) {
+    wl_list_remove(&kbd->link);
+    remove_listener_if_linked(&kbd->key);
+    remove_listener_if_linked(&kbd->modifiers);
+    remove_listener_if_linked(&kbd->destroy);
+    free(kbd);
+  }
+}
+
+static void cleanup_output_wrappers(struct compositor *comp) {
+  struct wlrlean_output *out, *tmp;
+  wl_list_for_each_safe(out, tmp, &comp->outputs, link) {
+    wl_list_remove(&out->link);
+    remove_listener_if_linked(&out->frame);
+    remove_listener_if_linked(&out->destroy);
+    free(out);
+  }
+}
+
+static void cleanup_layer_wrappers(struct compositor *comp) {
+  struct wlrlean_layer_surface *layer, *tmp;
+  wl_list_for_each_safe(layer, tmp, &comp->layer_surfaces, link) {
+    wl_list_remove(&layer->link);
+    remove_listener_if_linked(&layer->map);
+    remove_listener_if_linked(&layer->unmap);
+    remove_listener_if_linked(&layer->commit);
+    remove_listener_if_linked(&layer->destroy);
+    if (layer->scene_layer_surface) {
+      wlr_scene_node_destroy(&layer->scene_layer_surface->tree->node);
+      layer->scene_layer_surface = NULL;
+    }
+    free(layer);
+  }
+}
+
+static void cleanup_view_wrappers(struct compositor *comp) {
+  struct wlrlean_view *view, *tmp;
+  wl_list_for_each_safe(view, tmp, &comp->views, link) {
+    wl_list_remove(&view->link);
+    remove_listener_if_linked(&view->map);
+    remove_listener_if_linked(&view->unmap);
+    remove_listener_if_linked(&view->commit);
+    remove_listener_if_linked(&view->destroy);
+    if (view->scene_tree) {
+      wlr_scene_node_destroy(&view->scene_tree->node);
+      view->scene_tree = NULL;
+    }
+    free(view);
+  }
+  comp->focused_view = NULL;
+}
+
+static void cleanup_xwayland_wrappers(struct compositor *comp) {
+  struct wlrlean_xwayland_view *view, *tmp;
+  wl_list_for_each_safe(view, tmp, &comp->xwayland_views, link) {
+    wl_list_remove(&view->link);
+#if WLRLEAN_HAS_XWAYLAND
+    remove_listener_if_linked(&view->map);
+    remove_listener_if_linked(&view->unmap);
+    remove_listener_if_linked(&view->set_geometry);
+    remove_listener_if_linked(&view->request_configure);
+    remove_listener_if_linked(&view->request_activate);
+    remove_listener_if_linked(&view->associate);
+    remove_listener_if_linked(&view->dissociate);
+    remove_listener_if_linked(&view->destroy);
+#endif
+#if WLRLEAN_HAS_XWAYLAND
+    if (view->scene_tree) {
+      wlr_scene_node_destroy(&view->scene_tree->node);
+      view->scene_tree = NULL;
+    }
+#endif
+    free(view);
+  }
+  comp->focused_xwayland_view = NULL;
+}
+
+static void cleanup_apps(struct compositor *comp) {
+  struct registered_app *it = comp->apps;
+  while (it) {
+    struct registered_app *next = it->next;
+    free(it->command);
+    free(it);
+    it = next;
+  }
+  comp->apps = NULL;
+}
+
 static void close_extra_fds_in_child(void) {
   long max_fd = sysconf(_SC_OPEN_MAX);
   if (max_fd < 0) {
@@ -1501,8 +1591,7 @@ compositor_t *comp_create(void) {
   comp->display = wl_display_create();
   if (!comp->display) {
     fprintf(stderr, "[c] comp_create: wl_display_create failed\n");
-    free(comp);
-    return NULL;
+    goto fail;
   }
 
   comp->event_loop = wl_display_get_event_loop(comp->display);
@@ -1513,13 +1602,20 @@ compositor_t *comp_create(void) {
   }
   if (!comp->backend) {
     fprintf(stderr, "[c] comp_create: backend creation failed\n");
-    wl_display_destroy(comp->display);
-    free(comp);
-    return NULL;
+    goto fail;
   }
 
   if (!setup_renderer_allocator(comp)) {
     fprintf(stderr, "[c] comp_create: renderer init failed, retrying with WLR_RENDERER=pixman\n");
+    if (comp->allocator) {
+      wlr_allocator_destroy(comp->allocator);
+      comp->allocator = NULL;
+    }
+    if (comp->renderer) {
+      wlr_renderer_destroy(comp->renderer);
+      comp->renderer = NULL;
+    }
+    comp->wlr_compositor = NULL;
     setenv("WLR_RENDERER", "pixman", 0);
     if (!setup_renderer_allocator(comp)) {
       fprintf(stderr,
@@ -1527,9 +1623,7 @@ compositor_t *comp_create(void) {
               "(renderer=%p allocator=%p). "
               "Try WLR_RENDERER=pixman or WLR_BACKENDS=headless.\n",
               (void *)comp->renderer, (void *)comp->allocator);
-      wl_display_destroy(comp->display);
-      free(comp);
-      return NULL;
+      goto fail;
     }
   }
 
@@ -1539,22 +1633,16 @@ compositor_t *comp_create(void) {
   comp->output_layout = wlr_output_layout_create(comp->display);
   if (!comp->output_layout) {
     fprintf(stderr, "[c] comp_create: wlr_output_layout_create failed\n");
-    wl_display_destroy(comp->display);
-    free(comp);
-    return NULL;
+    goto fail;
   }
   comp->scene = wlr_scene_create();
   if (!comp->scene) {
     fprintf(stderr, "[c] comp_create: wlr_scene_create failed\n");
-    wl_display_destroy(comp->display);
-    free(comp);
-    return NULL;
+    goto fail;
   }
   if (!wlr_scene_attach_output_layout(comp->scene, comp->output_layout)) {
     fprintf(stderr, "[c] comp_create: wlr_scene_attach_output_layout failed\n");
-    wl_display_destroy(comp->display);
-    free(comp);
-    return NULL;
+    goto fail;
   }
 
   comp->background_tree = wlr_scene_tree_create(&comp->scene->tree);
@@ -1564,17 +1652,13 @@ compositor_t *comp_create(void) {
   comp->overlay_tree = wlr_scene_tree_create(&comp->scene->tree);
   if (!comp->background_tree || !comp->bottom_tree || !comp->workspace_tree || !comp->top_tree || !comp->overlay_tree) {
     fprintf(stderr, "[c] comp_create: failed to create scene layer trees\n");
-    wl_display_destroy(comp->display);
-    free(comp);
-    return NULL;
+    goto fail;
   }
 
   comp->cursor = wlr_cursor_create();
   if (!comp->cursor) {
     fprintf(stderr, "[c] comp_create: wlr_cursor_create failed\n");
-    wl_display_destroy(comp->display);
-    free(comp);
-    return NULL;
+    goto fail;
   }
   wlr_cursor_attach_output_layout(comp->cursor, comp->output_layout);
 
@@ -1589,23 +1673,17 @@ compositor_t *comp_create(void) {
   comp->seat = wlr_seat_create(comp->display, "seat0");
   if (!comp->seat) {
     fprintf(stderr, "[c] comp_create: wlr_seat_create failed\n");
-    wl_display_destroy(comp->display);
-    free(comp);
-    return NULL;
+    goto fail;
   }
   comp->xdg_shell = wlr_xdg_shell_create(comp->display, 6);
   if (!comp->xdg_shell) {
     fprintf(stderr, "[c] comp_create: wlr_xdg_shell_create failed\n");
-    wl_display_destroy(comp->display);
-    free(comp);
-    return NULL;
+    goto fail;
   }
   comp->layer_shell = wlr_layer_shell_v1_create(comp->display, 4);
   if (!comp->layer_shell) {
     fprintf(stderr, "[c] comp_create: wlr_layer_shell_v1_create failed\n");
-    wl_display_destroy(comp->display);
-    free(comp);
-    return NULL;
+    goto fail;
   }
 
 #if WLRLEAN_HAS_XWAYLAND
@@ -1662,6 +1740,10 @@ compositor_t *comp_create(void) {
 
   fprintf(stderr, "[c] comp_create: ok (build=2026-02-21c)\n");
   return comp;
+
+fail:
+  comp_destroy(comp);
+  return NULL;
 }
 
 int comp_start(compositor_t *base) {
@@ -1800,48 +1882,82 @@ void comp_destroy(compositor_t *base) {
     return;
   }
 
+  if (comp->destroying) {
+    return;
+  }
+
   fprintf(stderr, "[c] comp_destroy\n");
   comp->destroying = true;
 
-  if (comp->display) {
-    remove_listener_if_linked(&comp->new_layer_surface);
-    remove_listener_if_linked(&comp->new_xwayland_surface);
-    remove_listener_if_linked(&comp->xwayland_ready);
-    remove_listener_if_linked(&comp->request_cursor);
-    remove_listener_if_linked(&comp->cursor_motion);
-    remove_listener_if_linked(&comp->cursor_motion_absolute);
-    remove_listener_if_linked(&comp->cursor_button);
-    remove_listener_if_linked(&comp->cursor_axis);
-    remove_listener_if_linked(&comp->cursor_frame);
-    remove_listener_if_linked(&comp->new_output);
-    remove_listener_if_linked(&comp->new_input);
-    remove_listener_if_linked(&comp->new_xdg_surface);
-    remove_listener_if_linked(&comp->new_xdg_toplevel);
-    if (comp->xwayland) {
+  remove_listener_if_linked(&comp->new_layer_surface);
+  remove_listener_if_linked(&comp->new_xwayland_surface);
+  remove_listener_if_linked(&comp->xwayland_ready);
+  remove_listener_if_linked(&comp->request_cursor);
+  remove_listener_if_linked(&comp->cursor_motion);
+  remove_listener_if_linked(&comp->cursor_motion_absolute);
+  remove_listener_if_linked(&comp->cursor_button);
+  remove_listener_if_linked(&comp->cursor_axis);
+  remove_listener_if_linked(&comp->cursor_frame);
+  remove_listener_if_linked(&comp->new_output);
+  remove_listener_if_linked(&comp->new_input);
+  remove_listener_if_linked(&comp->new_xdg_surface);
+  remove_listener_if_linked(&comp->new_xdg_toplevel);
+
+  cleanup_keyboard_wrappers(comp);
+  cleanup_output_wrappers(comp);
+  cleanup_layer_wrappers(comp);
+  cleanup_view_wrappers(comp);
+  cleanup_xwayland_wrappers(comp);
+
+  if (comp->xwayland) {
 #if WLRLEAN_HAS_XWAYLAND
-      wlr_xwayland_destroy(comp->xwayland);
+    wlr_xwayland_destroy(comp->xwayland);
 #endif
-      comp->xwayland = NULL;
-    }
-    if (comp->cursor) {
-      wlr_cursor_destroy(comp->cursor);
-      comp->cursor = NULL;
-    }
-    if (comp->cursor_mgr) {
-      wlr_xcursor_manager_destroy(comp->cursor_mgr);
-      comp->cursor_mgr = NULL;
-    }
-    wl_display_destroy_clients(comp->display);
-    wl_display_destroy(comp->display);
+    comp->xwayland = NULL;
+  }
+  if (comp->cursor) {
+    wlr_cursor_destroy(comp->cursor);
+    comp->cursor = NULL;
+  }
+  if (comp->cursor_mgr) {
+    wlr_xcursor_manager_destroy(comp->cursor_mgr);
+    comp->cursor_mgr = NULL;
+  }
+  if (comp->scene) {
+    wlr_scene_node_destroy(&comp->scene->tree.node);
+    comp->scene = NULL;
+  }
+  comp->background_tree = NULL;
+  comp->bottom_tree = NULL;
+  comp->workspace_tree = NULL;
+  comp->top_tree = NULL;
+  comp->overlay_tree = NULL;
+  if (comp->output_layout) {
+    wlr_output_layout_destroy(comp->output_layout);
+    comp->output_layout = NULL;
+  }
+  if (comp->allocator) {
+    wlr_allocator_destroy(comp->allocator);
+    comp->allocator = NULL;
+  }
+  if (comp->renderer) {
+    wlr_renderer_destroy(comp->renderer);
+    comp->renderer = NULL;
+  }
+  comp->wlr_compositor = NULL;
+  if (comp->backend) {
+    wlr_backend_destroy(comp->backend);
+    comp->backend = NULL;
   }
 
-  struct registered_app *it = comp->apps;
-  while (it) {
-    struct registered_app *next = it->next;
-    free(it->command);
-    free(it);
-    it = next;
+  if (comp->display) {
+    wl_display_destroy_clients(comp->display);
+    wl_display_destroy(comp->display);
+    comp->display = NULL;
+    comp->event_loop = NULL;
   }
+
+  cleanup_apps(comp);
 
   free(comp);
 }
